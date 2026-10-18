@@ -6,7 +6,7 @@
    1. Grab the HTML elements we need
    2. The calculator "state" (its memory)
    3. Helper functions (math + formatting)
-   4. Calculator actions (digit, decimal, operator, ...)
+   4. Calculator actions (digit, decimal, operator, parentheses, ...)
    5. Showing things on the screen (render)
    6. Click + keyboard events
    7. Theme toggle (dark / light)
@@ -31,6 +31,8 @@ const expressionEl = document.getElementById('expression');
    One object that remembers everything the calculator needs.
    ---------------------------------------------------------- */
 const MAX_DIGITS = 15;                       // longest number the user can type
+const MAX_TOKENS = 60;                       // longest expression (numbers + operators + parentheses)
+const MAX_DEPTH  = 15;                       // deepest nesting of parentheses
 
 const OPERATOR_SYMBOLS = {                   // how each operator looks on screen
   '+': '+',
@@ -39,13 +41,15 @@ const OPERATOR_SYMBOLS = {                   // how each operator looks on scree
   '/': '÷'
 };
 
+// The expression is kept as a list of "tokens", for example (2 + 3) × 4 is:
+//   [ '(', 2, '+', 3, ')', '*', 4 ]
+// Numbers are stored as real numbers, everything else as text.
 const state = {
+  tokens: [],              // the expression typed so far (finished parts only)
   current: '0',            // the number on the big display (kept as text)
-  previous: null,          // the first number, saved when an operator is pressed
-  operator: null,          // '+', '-', '*', '/' or null
-  waitingForSecond: false, // true right after pressing an operator
+  typing: false,           // true while 'current' is a number the user is typing (not in tokens yet)
   overwrite: false,        // true when the next digit must start a NEW number
-  history: '',             // small text line, e.g. "125 × 4 ="
+  history: '',             // small text line after "=", e.g. "125 × 4 ="
   error: ''                // error message (empty = no error)
 };
 
@@ -68,6 +72,62 @@ function calculate(a, b, operator) {
 
   if (!Number.isFinite(value)) return { error: 'Number too large' };
   return { value: value };
+}
+
+// Calculate a whole list of tokens using the REAL math rules:
+//   1) parentheses first  2) × and ÷  3) + and −
+// This is a tiny "recursive descent" parser: each function below handles one level.
+// Returns { value } or { error }.
+function evaluateTokens(tokens) {
+  let position = 0;                                         // which token we are reading
+
+  function fail(message) { throw new Error(message); }
+
+  function apply(a, b, operator) {                          // reuse calculate() for the math
+    const result = calculate(a, b, operator);
+    if (result.error) fail(result.error);
+    return result.value;
+  }
+
+  // Level 1: + and −  (lowest priority)
+  function readSum() {
+    let value = readProduct();
+    while (tokens[position] === '+' || tokens[position] === '-') {
+      const operator = tokens[position++];
+      value = apply(value, readProduct(), operator);
+    }
+    return value;
+  }
+
+  // Level 2: × and ÷  (higher priority)
+  function readProduct() {
+    let value = readFactor();
+    while (tokens[position] === '*' || tokens[position] === '/') {
+      const operator = tokens[position++];
+      value = apply(value, readFactor(), operator);
+    }
+    return value;
+  }
+
+  // Level 3: a number, or something inside ( ... )  (highest priority)
+  function readFactor() {
+    const token = tokens[position++];
+    if (typeof token === 'number') return token;
+    if (token === '(') {
+      const value = readSum();                              // inside the parentheses start again from level 1
+      if (tokens[position++] !== ')') fail('Missing )');
+      return value;
+    }
+    return fail('Invalid expression');
+  }
+
+  try {
+    const value = readSum();
+    if (position !== tokens.length) fail('Invalid expression');   // something is left over
+    return { value: value };
+  } catch (error) {
+    return { error: error.message };
+  }
 }
 
 // Turn a number into clean text.
@@ -101,12 +161,26 @@ function countDigits(text) {
    4. CALCULATOR ACTIONS
    ---------------------------------------------------------- */
 
+// Small helpers to look at the expression.
+function lastToken()      { return state.tokens[state.tokens.length - 1]; }
+function isOperator(t)    { return t === '+' || t === '-' || t === '*' || t === '/'; }
+function isNumberToken(t) { return typeof t === 'number'; }
+
+// How many "(" are still waiting for their ")".
+function openParens() {
+  let open = 0;
+  state.tokens.forEach(function (token) {
+    if (token === '(') open++;
+    if (token === ')') open--;
+  });
+  return open;
+}
+
 // Go back to the starting state (used by AC).
 function resetAll() {
+  state.tokens = [];
   state.current = '0';
-  state.previous = null;
-  state.operator = null;
-  state.waitingForSecond = false;
+  state.typing = false;
   state.overwrite = false;
   state.history = '';
   state.error = '';
@@ -119,88 +193,182 @@ function showError(message, historyText) {
   state.history = historyText || '';
 }
 
+// Move the number being typed into the expression (tokens).
+// Returns false if the "number" is not valid (for example only a "-").
+function commitNumber() {
+  if (!state.typing) return true;
+  const number = parseFloat(state.current);
+  if (Number.isNaN(number)) return false;
+  state.tokens.push(number);
+  state.typing = false;
+  state.overwrite = false;
+  return true;
+}
+
+// A brand-new number is about to start.
+function startNewNumber() {
+  if (state.tokens.length === 0) state.history = '';        // a new calculation after "="
+  if (lastToken() === ')') state.tokens.push('*');          // (2+3)4 means (2+3) × 4
+  state.overwrite = false;
+}
+
 // A number key (0–9) was pressed.
 function inputDigit(digit) {
   if (state.error) resetAll();                              // start fresh after an error
 
-  if (state.waitingForSecond || state.overwrite) {
-    if (!state.operator) state.history = '';                // new number after "="
-    state.current = digit;                                  // begin a new number
-    state.waitingForSecond = false;
-    state.overwrite = false;
+  // Still typing the same number: add the digit at the end.
+  if (state.typing && !state.overwrite) {
+    if (countDigits(state.current) >= MAX_DIGITS) return;   // too long, ignore
+    if (state.current === '0')       state.current = digit;
+    else if (state.current === '-0') state.current = '-' + digit;
+    else                             state.current += digit;
     return;
   }
 
-  if (countDigits(state.current) >= MAX_DIGITS) return;     // too long, ignore
-  state.current = state.current === '0' ? digit : state.current + digit;
+  // Otherwise a new number starts.
+  if (state.tokens.length >= MAX_TOKENS) return;
+  startNewNumber();
+  state.current = digit;
+  state.typing = true;
 }
 
 // The "." key was pressed.
 function inputDecimal() {
   if (state.error) resetAll();
 
-  if (state.waitingForSecond || state.overwrite) {
-    if (!state.operator) state.history = '';
-    state.current = '0.';                                   // ".5" becomes "0.5"
-    state.waitingForSecond = false;
-    state.overwrite = false;
+  if (state.typing && !state.overwrite) {
+    if (state.current.includes('.')) return;                // only one dot allowed
+    state.current += (state.current === '-' ? '0.' : '.');  // "-" then "." becomes "-0."
     return;
   }
 
-  if (state.current.includes('.')) return;                  // only one dot allowed
-  state.current += '.';
+  if (state.tokens.length >= MAX_TOKENS) return;
+  startNewNumber();
+  state.current = '0.';                                     // ".5" becomes "0.5"
+  state.typing = true;
 }
 
 // An operator key (+ − × ÷) was pressed.
 function inputOperator(operator) {
   if (state.error) return;
+  if (state.tokens.length >= MAX_TOKENS) return;
 
-  // Pressed two operators in a row (e.g. "5 + ×")? Just replace the operator.
-  if (state.operator && state.waitingForSecond) {
-    state.operator = operator;
-    return;
-  }
+  if (state.typing) {
+    if (!commitNumber()) return;                            // a lone "-" can't be followed by an operator
+  } else if (state.tokens.length === 0) {
+    state.tokens.push(parseFloat(state.current));           // continue from the last result (or 0)
+    state.history = '';
+  } else {
+    const last = lastToken();
 
-  // Already have "a + b" and user pressed another operator? Finish that first.
-  if (state.operator) {
-    const result = calculate(state.previous, parseFloat(state.current), state.operator);
-    if (result.error) {
-      showError(result.error, numberToText(state.previous) + ' ' + OPERATOR_SYMBOLS[state.operator] + ' ' + state.current + ' =');
+    // Pressed two operators in a row (e.g. "5 + ×")? Just replace the operator.
+    if (isOperator(last)) {
+      state.tokens[state.tokens.length - 1] = operator;
       return;
     }
-    state.previous = result.value;
-    state.current = numberToText(result.value);
-  } else {
-    state.previous = parseFloat(state.current);
+    // Right after "(" only a minus makes sense (a negative number, like "(-5 + 2)").
+    if (last === '(') {
+      if (operator === '-') {
+        state.current = '-';
+        state.typing = true;
+        state.overwrite = false;
+      }
+      return;
+    }
   }
 
-  state.operator = operator;
-  state.waitingForSecond = true;
+  state.tokens.push(operator);
+}
+
+// The "(" key was pressed.
+function inputParenOpen() {
+  if (state.error) resetAll();
+  if (state.tokens.length >= MAX_TOKENS - 1 || openParens() >= MAX_DEPTH) return;
+
+  if (state.typing) {
+    if (!commitNumber()) return;
+    state.tokens.push('*');                                 // 2( means 2 × (
+  } else {
+    if (state.tokens.length === 0) state.history = '';      // a new calculation after "="
+    if (lastToken() === ')') state.tokens.push('*');        // )( means ) × (
+  }
+
+  state.tokens.push('(');
+  state.current = '0';
   state.overwrite = false;
-  state.history = '';
+}
+
+// The ")" key was pressed.
+function inputParenClose() {
+  if (state.error) return;
+  if (openParens() <= 0) return;                            // there is no "(" to close
+
+  if (state.typing) {
+    if (!commitNumber()) return;
+  } else {
+    const last = lastToken();
+    if (last === undefined || isOperator(last) || last === '(') return;   // "()" and "(5+)" are invalid
+  }
+
+  state.tokens.push(')');
+
+  // Show the value of the group we just closed on the big display.
+  let depth = 0;
+  let start = 0;
+  for (let i = state.tokens.length - 1; i >= 0; i--) {
+    if (state.tokens[i] === ')') depth++;
+    if (state.tokens[i] === '(') {
+      depth--;
+      if (depth === 0) { start = i; break; }
+    }
+  }
+  const group = evaluateTokens(state.tokens.slice(start));
+  if (group.value !== undefined) state.current = numberToText(group.value);
 }
 
 // The "=" key was pressed.
 function inputEquals() {
   if (state.error) return;
-  if (!state.operator || state.waitingForSecond) return;    // nothing to calculate yet
+  if (state.tokens.length === 0) return;                    // nothing to calculate yet
 
-  const a = state.previous;
-  const b = parseFloat(state.current);
-  const symbol = OPERATOR_SYMBOLS[state.operator];
-  const result = calculate(a, b, state.operator);
-  const historyText = formatForDisplay(numberToText(a)) + ' ' + symbol + ' ' + formatForDisplay(state.current) + ' =';
+  if (state.typing) {
+    if (!commitNumber()) return;
+  } else {
+    const last = lastToken();
+    if (isOperator(last) || last === '(') return;           // unfinished, like "5 +"
+  }
+
+  while (openParens() > 0) state.tokens.push(')');          // close any "(" the user forgot
+
+  const historyText = buildExpressionText() + ' =';
+  const result = evaluateTokens(state.tokens);
 
   if (result.error) {
     showError(result.error, historyText);
     return;
   }
 
-  state.history = historyText;
-  state.current = numberToText(result.value);
-  state.previous = null;
-  state.operator = null;
+  state.tokens = [];
+  state.typing = false;
   state.overwrite = true;                                   // next digit starts a new number
+  state.current = numberToText(result.value);
+  state.history = historyText;
+}
+
+// The part of the expression that comes BEFORE the last "+" or "−" (used by %).
+// Inside parentheses we only look back to the nearest unclosed "(".
+function tokensBeforeLastOperator() {
+  const tokens = state.tokens.slice(0, -1);
+  let depth = 0;
+  let start = 0;
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    if (tokens[i] === ')') depth++;
+    if (tokens[i] === '(') {
+      if (depth === 0) { start = i + 1; break; }
+      depth--;
+    }
+  }
+  return tokens.slice(start);
 }
 
 // The "%" key was pressed.
@@ -210,39 +378,61 @@ function inputEquals() {
 //   • 50 %        ->  50 / 100    = 0.5  (no operator)
 function inputPercent() {
   if (state.error) return;
-  if (state.waitingForSecond) return;                       // needs a number first
-
+  if (!state.typing && state.tokens.length > 0) return;     // needs a number first
   const number = parseFloat(state.current);
-  let value;
+  if (Number.isNaN(number)) return;                         // only a "-" so far
 
-  if (state.operator === '+' || state.operator === '-') {
-    value = state.previous * number / 100;
-  } else {
-    value = number / 100;
+  let value = number / 100;
+  const last = lastToken();
+
+  if (state.typing && (last === '+' || last === '-')) {
+    const base = evaluateTokens(tokensBeforeLastOperator());
+    if (base.value !== undefined) value = base.value * number / 100;
   }
 
   state.current = numberToText(value);
+  state.typing = true;
   state.overwrite = true;                                   // typing a digit now starts a new number
 }
 
-// The "DEL" key: remove the last character.
+// The "DEL" key: remove the last character (or the last operator / parenthesis).
 function inputDelete() {
   if (state.error) { resetAll(); return; }
-  if (state.waitingForSecond || state.overwrite) return;    // nothing typed to delete
 
-  state.current = state.current.slice(0, -1);
-  if (state.current === '' || state.current === '-') state.current = '0';
+  // A number is being typed: remove its last digit.
+  if (state.typing) {
+    if (state.overwrite) return;                            // a % result can't be shortened
+    state.current = state.current.slice(0, -1);
+    if (state.current === '') {
+      state.typing = false;
+      state.current = '0';
+    }
+    return;
+  }
+
+  if (state.tokens.length === 0) return;                    // nothing to delete (e.g. after "=")
+
+  state.tokens.pop();                                       // remove the last operator or parenthesis
+  if (isNumberToken(lastToken())) {
+    // A number is now at the end: go back to editing it (so "5 +" + DEL gives "5" again).
+    state.current = numberToText(state.tokens.pop());
+    state.typing = true;
+  } else {
+    state.current = '0';
+  }
 }
 
 // Decide which function to run for a button / key.
 function runAction(action, value) {
-  if (action === 'digit')    inputDigit(value);
-  if (action === 'decimal')  inputDecimal();
-  if (action === 'operator') inputOperator(value);
-  if (action === 'equals')   inputEquals();
-  if (action === 'percent')  inputPercent();
-  if (action === 'delete')   inputDelete();
-  if (action === 'clear')    resetAll();
+  if (action === 'digit')       inputDigit(value);
+  if (action === 'decimal')     inputDecimal();
+  if (action === 'operator')    inputOperator(value);
+  if (action === 'paren-open')  inputParenOpen();
+  if (action === 'paren-close') inputParenClose();
+  if (action === 'equals')      inputEquals();
+  if (action === 'percent')     inputPercent();
+  if (action === 'delete')      inputDelete();
+  if (action === 'clear')       resetAll();
   render();
 }
 
@@ -250,13 +440,27 @@ function runAction(action, value) {
 /* ----------------------------------------------------------
    5. SHOW THINGS ON THE SCREEN
    ---------------------------------------------------------- */
+// Build the small line of text, e.g. "(2 + 3) × 4".
+function buildExpressionText() {
+  const parts = state.tokens.map(function (token) {
+    if (isNumberToken(token)) return formatForDisplay(numberToText(token));
+    return OPERATOR_SYMBOLS[token] || token;                // "(" and ")" stay as they are
+  });
+  if (state.typing) parts.push(formatForDisplay(state.current));
+
+  let text = '';
+  parts.forEach(function (part, index) {
+    const needsSpace = index > 0 && part !== ')' && parts[index - 1] !== '(';
+    text += (needsSpace ? ' ' : '') + part;
+  });
+  return text;
+}
+
 function render() {
-  // Small line on top
-  if (state.operator) {
-    expressionEl.textContent = formatForDisplay(numberToText(state.previous)) + ' ' + OPERATOR_SYMBOLS[state.operator];
-  } else {
-    expressionEl.textContent = state.history;
-  }
+  // Small line on top (a very long expression shows only its end)
+  let expression = state.tokens.length > 0 ? buildExpressionText() : state.history;
+  if (expression.length > 26) expression = '…' + expression.slice(-25);
+  expressionEl.textContent = expression;
 
   // Big number (or error message)
   const text = state.error ? state.error : formatForDisplay(state.current);
@@ -290,6 +494,8 @@ const KEY_MAP = {
   '/': { action: 'operator', value: '/' },
   '.': { action: 'decimal' },
   ',': { action: 'decimal' },
+  '(': { action: 'paren-open' },
+  ')': { action: 'paren-close' },
   '%': { action: 'percent' },
   '=': { action: 'equals' },
   'Enter': { action: 'equals' },

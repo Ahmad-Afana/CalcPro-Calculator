@@ -262,7 +262,7 @@ section[id] { scroll-margin-top: 100px; }
 /* The background image + a colour overlay, fading out at the bottom */
 .hero::before {
   content: ""; position: absolute; inset: 0; z-index: -1;
-  background: var(--hero-overlay), url("/imgs/background.jpg") center bottom / cover no-repeat;
+  background: var(--hero-overlay), url("imgs/background.jpg") center bottom / cover no-repeat;
   -webkit-mask-image: linear-gradient(to bottom, #000 78%, transparent 100%);
   mask-image: linear-gradient(to bottom, #000 78%, transparent 100%);
 }
@@ -399,6 +399,9 @@ section[id] { scroll-margin-top: 100px; }
 
 .key--fn { font-size: clamp(1.2rem, 3.6vw, 1.7rem); }
 .key--zero { grid-column: span 2; aspect-ratio: auto; }
+
+/* Parentheses row: two wide, slightly shorter keys above the AC row */
+.key--paren { grid-column: span 2; aspect-ratio: 3.2 / 1; font-size: clamp(1.45rem, 4.2vw, 1.95rem); }
 
 .key--op {
   font-size: clamp(1.7rem, 5vw, 2.2rem); color: #fff;
@@ -605,6 +608,7 @@ kbd {
 
 @media (max-width: 380px) {
   .calculator { padding: 16px; }
+  .key--paren { aspect-ratio: 3 / 1; }
   .keypad { gap: 9px; }
   .features__grid { grid-template-columns: 1fr; }
 }
